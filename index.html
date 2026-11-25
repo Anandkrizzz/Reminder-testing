@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reminder Engine Test</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1b6b5a">
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; font-size: 18px; max-width: 640px; margin-inline: auto; }
+  h1 { font-size: 22px; } h2 { font-size: 19px; margin-top: 24px; }
+  button { display: block; width: 100%; font-size: 18px; padding: 14px; margin: 8px 0; border: 0; border-radius: 10px; background: #1b6b5a; color: #fff; }
+  button.alt { background: #444; }
+  .box { border: 1px solid #bbb; border-radius: 10px; padding: 10px 14px; margin: 8px 0; }
+  .ok { color: #0a7a2f; } .bad { color: #b00020; } .warn { color: #b26a00; }
+  pre { background: #f4f4f4; padding: 10px; border-radius: 8px; font-size: 14px; white-space: pre-wrap; max-height: 260px; overflow: auto; }
+</style>
+</head>
+<body>
+<h1>Reminder Engine Test (Member 1)</h1>
+
+<h2>Status</h2>
+<div class="box" id="status"></div>
+
+<h2>Step 1: Permission</h2>
+<button id="btnPerm">Allow notifications</button>
+
+<h2>Step 2: Notification tests</h2>
+<button id="btnNow">Notify now</button>
+<button id="btnPage">Remind me in 1 minute (page timer)</button>
+<button id="btnSW" class="alt">Remind me in 1 minute (service worker timer)</button>
+<p>For the real test: tap a button, then lock the screen or switch apps, and see if the notification arrives.</p>
+
+<h2>Step 3: Demo medicines (engine checks every 5 seconds)</h2>
+<div id="meds"></div>
+
+<h2>Log</h2>
+<pre id="log"></pre>
+
+<script src="reminder-engine.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const SNOOZE_MIN = 5;
+const fired = new Set();      // doses already announced
+let snoozed = [];             // doses waiting for a snooze to end
+let reg = null;
+
+function log(m) { $('log').textContent = new Date().toLocaleTimeString() + '  ' + m + '\n' + $('log').textContent; }
+const hhmm = d => String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const plusDays = n => { const d = new Date(); d.setDate(d.getDate() + n); return ymd(d); };
+
+// Demo data: doses fall 1 and 2 minutes from now so you can see them fire
+const t = m => hhmm(new Date(Date.now() + m * 60000));
+const meds = [
+  { id: 'm1', name: 'Paracetamol', dose: '1 tablet', times: [t(1), t(2)], startDate: ymd(new Date()), days: 7, expiry: plusDays(200) },
+  { id: 'm2', name: 'Vitamin D', dose: '1 capsule', times: ['09:00'], startDate: ymd(new Date()), days: null, expiry: plusDays(12) },
+  { id: 'm3', name: 'Old cough syrup', dose: '5 ml', times: ['21:00'], startDate: ymd(new Date()), days: 5, expiry: plusDays(-3) }
+];
+
+function renderStatus() {
+  const perm = 'Notification' in window ? Notification.permission : 'not supported';
+  const standalone = matchMedia('(display-mode: standalone)').matches;
+  $('status').innerHTML =
+    'Secure page (https or localhost): <b class="' + (isSecureContext ? 'ok' : 'bad') + '">' + isSecureContext + '</b><br>' +
+    'Service worker: <b class="' + (reg ? 'ok' : 'warn') + '">' + (reg ? 'active' : 'not ready') + '</b><br>' +
+    'Notification permission: <b class="' + (perm === 'granted' ? 'ok' : 'warn') + '">' + perm + '</b><br>' +
+    'Installed app mode: <b>' + (standalone ? 'yes' : 'no (open in browser)') + '</b>';
+}
+
+function renderMeds() {
+  const now = new Date();
+  $('meds').innerHTML = meds.map(m => {
+    const nx = ReminderEngine.nextDose(m, now);
+    const ex = ReminderEngine.expiryStatus(m, now);
+    const cls = ex.status === 'expired' ? 'bad' : ex.status === 'soon' ? 'warn' : 'ok';
+    const exText = ex.status === 'expired' ? 'EXPIRED ' + (-ex.days) + ' days ago' : ex.status === 'soon' ? 'expires in ' + ex.days + ' days' : 'expiry OK';
+    return '<div class="box"><b>' + m.name + '</b> (' + m.dose + ')<br>Times: ' + m.times.join(', ') +
+      '<br>Next dose: ' + (nx ? nx.at.toLocaleTimeString() : 'none') + '<br><span class="' + cls + '">' + exText + '</span></div>';
+  }).join('');
+}
+
+async function notify(title, opts) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') { log('Permission not granted: allow notifications first.'); return; }
+  const o = Object.assign({ requireInteraction: true }, opts);
+  if (reg) await reg.showNotification(title, o); else new Notification(title, o);
+}
+
+function announce(dose, isSnooze) {
+  fired.add(dose.id);
+  log((isSnooze ? 'SNOOZE ENDED: ' : 'DUE: ') + dose.name + ' at ' + new Date(dose.at).toLocaleTimeString());
+  notify('Time for ' + dose.name, {
+    body: dose.dose + ' (' + new Date(dose.at).toLocaleTimeString() + ')',
+    tag: dose.id, data: { doseId: dose.id },
+    actions: [{ action: 'taken', title: 'Taken' }, { action: 'snooze', title: 'Snooze ' + SNOOZE_MIN + ' min' }]
+  });
+}
+
+function tick() {
+  const now = new Date();
+  ReminderEngine.dueNow(meds, now, fired).forEach(d => announce(d, false));
+  const ready = snoozed.filter(s => s.at <= now);
+  snoozed = snoozed.filter(s => s.at > now);
+  ready.forEach(s => announce(s, true));
+  renderMeds();
+}
+
+function handleAction(action, doseId) {
+  const name = (doseId.split('|')[0]) || '';
+  if (action === 'taken') log('Marked TAKEN: ' + doseId);
+  else if (action === 'snooze') {
+    const med = meds.find(m => m.id === name) || { name: name, dose: '' };
+    snoozed.push({ id: doseId + '#snooze' + Date.now(), medId: med.id, name: med.name, dose: med.dose, at: new Date(Date.now() + SNOOZE_MIN * 60000) });
+    log('Snoozed ' + SNOOZE_MIN + ' min: ' + doseId);
+  } else log('Notification opened: ' + doseId);
+}
+
+$('btnPerm').onclick = async () => { const r = await Notification.requestPermission(); log('Permission: ' + r); renderStatus(); };
+$('btnNow').onclick = () => { log('Sending test notification now'); notify('Test reminder', { body: 'Notifications work on this device.', tag: 'now-test' }); };
+$('btnPage').onclick = () => { log('Page timer started (1 minute)'); setTimeout(() => { log('Page timer fired'); notify('Test reminder (page timer)', { body: 'Fired after 60 seconds', tag: 'page-test' }); }, 60000); };
+$('btnSW').onclick = () => {
+  if (!reg || !reg.active) { log('Service worker not ready yet'); return; }
+  reg.active.postMessage({ type: 'schedule-test', delayMs: 60000 });
+  log('Service worker timer started (1 minute). Try closing the tab now.');
+};
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').then(() => navigator.serviceWorker.ready).then(r => { reg = r; renderStatus(); log('Service worker ready'); });
+  navigator.serviceWorker.addEventListener('message', e => { if (e.data && e.data.type === 'notification-action') handleAction(e.data.action, e.data.doseId); });
+}
+const q = new URLSearchParams(location.search);
+if (q.get('action')) handleAction(q.get('action'), q.get('dose') || '');
+
+renderStatus(); renderMeds(); setInterval(tick, 5000); tick();
+log('Alerts to expect: Paracetamol at ' + meds[0].times.join(' and ') + '. Vitamin D expires soon; Old cough syrup is expired.');
+log('Expiry alerts: ' + ReminderEngine.expiryAlerts(meds, new Date()).map(a => a.med.name + ' (' + a.status + ')').join(', '));
+</script>
+</body>
+</html>
