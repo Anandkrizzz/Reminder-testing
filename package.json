@@ -1,0 +1,7 @@
+{
+  "name": "medimate-push-demo",
+  "version": "1.0.0",
+  "description": "Web Push reminder prototype for MediMate (Member 1)",
+  "scripts": { "start": "node push-server.js", "test": "node test/push.test.js" },
+  "dependencies": { "web-push": "^3.6.7" }
+}
